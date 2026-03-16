@@ -1,87 +1,157 @@
 # rapidindex/indexes/bm25_index.py
 
+import pickle
+from pathlib import Path
 from rank_bm25 import BM25Okapi
 import nltk
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from loguru import logger
 
-# Download required NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt', quiet=True)
 
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab', quiet=True)
+
 
 class BM25Index:
     """BM25-based keyword search index."""
-    
+
     def __init__(self):
-        self.index = None
-        self.documents = {}  # doc_id -> Document
-        self.section_map = {}  # section_id -> (doc_id, section)
-        self.tokenized_corpus = []
+        self.index: Optional[BM25Okapi] = None
+        self.documents: Dict = {}           # doc_id -> Document
+        self.section_map: Dict = {}         # section_id -> (doc_id, section)
+
+        # FIX: explicit ordered list that mirrors tokenized_corpus position-for-position.
+        # Previously we used list(self.section_map.keys())[idx] which breaks
+        # the moment any dict ordering assumption is violated (e.g. after a
+        # pickle round-trip on Python < 3.7, or after selective deletion).
+        self.section_ids: List[str] = []    # index i -> section_id
+        self.tokenized_corpus: List[List[str]] = []
+
         logger.info("BM25Index initialized")
-    
-    def add_document(self, document):
-        """Add document to BM25 index."""
-        from ..core.document import Document
-        
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
+
+    def add_document(self, document) -> None:
+        """Add document to BM25 index (idempotent per section)."""
         self.documents[document.id] = document
-        
-        # Tokenize each section
+
+        added = 0
         for section in document.sections:
-            # Store section mapping
+            if section.id in self.section_map:
+                # Already indexed — skip to keep corpus/section_ids in sync.
+                continue
+
             self.section_map[section.id] = (document.id, section)
-            
-            # Tokenize section content
             tokens = self._tokenize(section.title + " " + section.content)
+            self.section_ids.append(section.id)
             self.tokenized_corpus.append(tokens)
-        
-        # Rebuild BM25 index
-        self._rebuild_index()
-        logger.info(f"Document added to BM25: {document.id} ({len(document.sections)} sections)")
-    
+            added += 1
+
+        if added:
+            self._rebuild_index()
+
+        logger.info(
+            f"Document added to BM25: {document.id} "
+            f"({added} new sections, {len(document.sections) - added} already indexed)"
+        )
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
     def search(self, query: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        """Search for relevant sections."""
+        """Return (section_id, score) pairs sorted by relevance."""
         if not self.index:
             logger.warning("BM25 index is empty")
             return []
-        
-        # Tokenize query
+
         tokenized_query = self._tokenize(query)
-        
-        # Get BM25 scores
         scores = self.index.get_scores(tokenized_query)
-        
-        # Get top-k results
+
         top_indices = sorted(
-            range(len(scores)), 
-            key=lambda i: scores[i], 
-            reverse=True
+            range(len(scores)),
+            key=lambda i: scores[i],
+            reverse=True,
         )[:top_k]
-        
-        # Map back to section IDs
+
         results = []
-        section_ids = list(self.section_map.keys())
-        
         for idx in top_indices:
-            if idx < len(section_ids):
-                section_id = section_ids[idx]
-                score = scores[idx]
-                results.append((section_id, score))
-        
+            if idx < len(self.section_ids):
+                score = float(scores[idx])
+                if score > 0:                   # skip zero-score noise
+                    results.append((self.section_ids[idx], score))
+
         return results
-    
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> bool:
+        """Pickle the index to disk so it survives restarts."""
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as fh:
+                pickle.dump(
+                    {
+                        "section_ids": self.section_ids,
+                        "tokenized_corpus": self.tokenized_corpus,
+                        "section_map": self.section_map,
+                        "documents": self.documents,
+                    },
+                    fh,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            logger.info(f"BM25 index saved: {path} ({len(self.section_ids)} sections)")
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to save BM25 index: {exc}")
+            return False
+
+    def load(self, path: str) -> bool:
+        """Load a previously saved index from disk."""
+        if not Path(path).exists():
+            return False
+        try:
+            with open(path, "rb") as fh:
+                data = pickle.load(fh)
+
+            self.section_ids = data["section_ids"]
+            self.tokenized_corpus = data["tokenized_corpus"]
+            self.section_map = data["section_map"]
+            self.documents = data["documents"]
+            self._rebuild_index()
+
+            logger.info(
+                f"BM25 index loaded: {path} ({len(self.section_ids)} sections)"
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to load BM25 index: {exc}")
+            # Reset to clean state so callers can rebuild safely
+            self.__init__()
+            return False
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
     def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text for BM25."""
         tokens = nltk.word_tokenize(text.lower())
         return [t for t in tokens if len(t) > 2 and t.isalnum()]
-    
-    def _rebuild_index(self):
-        """Rebuild BM25 index from corpus."""
+
+    def _rebuild_index(self) -> None:
         if self.tokenized_corpus:
             self.index = BM25Okapi(self.tokenized_corpus)
             logger.debug(f"BM25 index rebuilt: {len(self.tokenized_corpus)} sections")
 
 
-__all__ = ['BM25Index']
+__all__ = ["BM25Index"]
