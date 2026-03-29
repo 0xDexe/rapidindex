@@ -1,11 +1,30 @@
-# benchmarks/run_benchmark.py
-"""Run benchmarks on RapidIndex."""
+#!/usr/bin/env python3
+# benchmarking/run_benchmark.py
+"""
+Run RapidIndex against FinanceBench.
 
+Quick start
+-----------
+# Smoke test — 5 questions, local Ollama
+python -m benchmarking.run_benchmark --sample-size 5 --provider ollama
+
+# Full open-source set — 150 questions, Anthropic
+python -m benchmarking.run_benchmark --sample-size 150 --provider anthropic
+
+# Keyword-only mode (no LLM, measures pure retrieval)
+python -m benchmarking.run_benchmark --sample-size 20 --mode keyword
+
+# Single company deep-dive
+python -m benchmarking.run_benchmark --company 3M --provider ollama
+"""
+
+import argparse
 import asyncio
 import json
 import time
 from pathlib import Path
 from typing import Optional
+
 from loguru import logger
 
 from rapidindex import RapidIndexer, Retriever, RetrievalMode
@@ -26,22 +45,18 @@ async def run_benchmark(
     sample_size: int = 50,
     output_file: str = "benchmark_results.json",
     llm_provider: Optional[str] = None,
-):
-    """Run benchmark."""
+    company_filter: Optional[str] = None,
+    data_dir: str = "./benchmarking/datasets/financebench",
+) -> dict:
 
     provider = llm_provider or config.llm_provider
-    # FIX: RetrievalMode is a str-enum.  In CPython < 3.11 str-enums happen
-    # to serialise with json.dump, but in 3.11+ the behaviour changed and
-    # the enum is no longer automatically unwrapped.  Always use .value so
-    # the output is a plain string regardless of Python version.
     mode_value: str = mode.value if isinstance(mode, RetrievalMode) else str(mode)
 
-    logger.info(f"Starting benchmark")
-    logger.info(f"Mode: {mode_value}")
-    logger.info(f"LLM Provider: {provider}")
-    logger.info(f"Sample size: {sample_size}")
+    logger.info(f"Mode: {mode_value}  |  Provider: {provider}  |  Sample: {sample_size}")
 
-    # Initialise components
+    # ------------------------------------------------------------------
+    # Build components
+    # ------------------------------------------------------------------
     storage = SQLiteStorage(config.database_url)
     bm25_index = BM25Index()
     embedding_index = EmbeddingIndex()
@@ -52,14 +67,12 @@ async def run_benchmark(
             model=config.ollama_model,
             ollama_url=config.ollama_url,
         )
-        logger.info(f"Using Ollama: {config.ollama_model} (FREE)")
     elif provider == "anthropic":
         llm_client = LLMClient(
             provider="anthropic",
             api_key=config.anthropic_api_key,
             model=config.anthropic_model,
         )
-        logger.info(f"Using Anthropic: {config.anthropic_model} (PAID)")
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -69,104 +82,197 @@ async def run_benchmark(
         bm25_index=bm25_index,
         embedding_index=embedding_index,
     )
-
-    retrieval_config = RetrievalConfig(mode=mode)
     retriever = Retriever(
         bm25_index=bm25_index,
         embedding_index=embedding_index,
         llm_client=llm_client,
         cache_manager=cache_manager,
-        config=retrieval_config,
+        config=RetrievalConfig(mode=mode),
     )
 
+    # ------------------------------------------------------------------
     # Load dataset
-    dataset = FinanceBenchDataset()
+    # ------------------------------------------------------------------
+    dataset = FinanceBenchDataset(data_dir=data_dir)
     questions, documents = dataset.load()
 
-    # Index documents
-    logger.info(f"Indexing {len(documents)} documents...")
+    if company_filter:
+        questions = [
+            q for q in questions
+            if q.get("company", "").upper() == company_filter.upper()
+        ]
+        logger.info(f"Filtered to company={company_filter}: {len(questions)} questions")
+
+    if not questions:
+        logger.error("No questions loaded — run: python -m benchmarking.setup_financebench")
+        return {}
+
+    if not documents:
+        logger.error(
+            "No PDFs found — run: "
+            "python -m benchmarking.setup_financebench --download-pdfs"
+        )
+        return {}
+
+    # ------------------------------------------------------------------
+    # Index documents (warm-reload skips already-indexed ones)
+    # ------------------------------------------------------------------
+    logger.info(f"Indexing {len(documents)} PDFs...")
     for doc_path in documents:
         try:
             indexer.index_document(str(doc_path))
         except Exception as exc:
-            logger.error(f"Failed to index {doc_path}: {exc}")
+            logger.error(f"Failed to index {doc_path.name}: {exc}")
 
+    # ------------------------------------------------------------------
     # Run queries
-    logger.info(f"Running {sample_size} queries...")
+    # ------------------------------------------------------------------
+    questions_to_run = questions[:sample_size]
+    logger.info(f"Running {len(questions_to_run)} queries...")
     results = []
 
-    for i, question_data in enumerate(questions[:sample_size]):
-        query = question_data["question"]
-        ground_truth = question_data.get("answer", "")
+    for i, q in enumerate(questions_to_run):
+        query        = q["question"]
+        ground_truth = q.get("answer", "")
+        doc_name     = q.get("doc_name", "")
+        q_type       = q.get("question_type", "unknown")
 
-        logger.info(f"Query {i + 1}/{sample_size}: {query}")
+        pdf_present = (Path(data_dir) / "pdfs" / f"{doc_name}.pdf").exists()
+        if not pdf_present:
+            logger.warning(f"PDF not on disk, answer may be wrong: {doc_name}")
 
-        start_time = time.time()
+        logger.info(f"[{i+1}/{len(questions_to_run)}] ({q_type}) {query[:80]}...")
 
+        t0 = time.time()
         try:
             result = await retriever.search(query)
-            latency_ms = (time.time() - start_time) * 1000
+            latency_ms = (time.time() - t0) * 1000
             answer = result.answer
 
-            result_data = {
-                "query": query,
-                "answer": answer,
-                "ground_truth": ground_truth,
-                "exact_match": exact_match(answer, ground_truth),
-                "contains_match": contains_match(answer, ground_truth),
-                "number_match": number_match(answer, ground_truth),
-                "confidence": result.confidence,
-                "latency_ms": latency_ms,
-                "num_sections": len(result.sections),
-                # FIX: use plain string so json.dump never hits a
-                # non-serialisable enum value.
-                "mode": mode_value,
-                "provider": provider,
+            row = {
+                "financebench_id": q.get("financebench_id"),
+                "company":         q.get("company"),
+                "doc_name":        doc_name,
+                "question_type":   q_type,
+                "question":        query,
+                "answer":          answer,
+                "ground_truth":    ground_truth,
+                "exact_match":     exact_match(answer, ground_truth),
+                "contains_match":  contains_match(answer, ground_truth),
+                "number_match":    number_match(answer, ground_truth),
+                "confidence":      result.confidence,
+                "latency_ms":      latency_ms,
+                "num_sections":    len(result.sections),
+                "mode":            mode_value,
+                "provider":        provider,
             }
-            results.append(result_data)
+            results.append(row)
 
+            mark = "✓" if row["contains_match"] else "✗"
             logger.info(
-                f"Latency: {latency_ms:.2f}ms, "
-                f"Confidence: {result.confidence}, "
-                f"Match: {result_data['contains_match']}"
+                f"  {mark}  {latency_ms:.0f}ms  "
+                f"conf={result.confidence:.2f}  "
+                f"{answer[:60]}..."
             )
 
         except Exception as exc:
-            logger.error(f"Query failed: {exc}")
+            logger.error(f"  Query failed: {exc}")
             results.append({
-                "query": query,
-                "error": str(exc),
-                "latency_ms": 0,
-                "confidence": 0,
-                "mode": mode_value,
-                "provider": provider,
+                "financebench_id": q.get("financebench_id"),
+                "company":         q.get("company"),
+                "doc_name":        doc_name,
+                "question_type":   q_type,
+                "question":        query,
+                "ground_truth":    ground_truth,
+                "error":           str(exc),
+                "latency_ms":      0.0,
+                "confidence":      0.0,
+                "mode":            mode_value,
+                "provider":        provider,
             })
 
-    metrics = calculate_accuracy(results)
-    metrics["provider"] = provider  # type: ignore
+    # ------------------------------------------------------------------
+    # Aggregate metrics
+    # ------------------------------------------------------------------
+    overall = calculate_accuracy(results)
+    overall["provider"] = provider
+    overall["mode"] = mode_value
 
-    logger.success("Benchmark complete!")
-    logger.info(f"Provider: {provider}")
-    logger.info(f"Accuracy: {metrics['contains_accuracy']:.1%}")
-    logger.info(f"Avg latency: {metrics['avg_latency_ms']:.2f}ms")
+    by_type: dict = {}
+    for q_type in FinanceBenchDataset.QUESTION_TYPES:
+        subset = [r for r in results if r.get("question_type") == q_type]
+        if subset:
+            by_type[q_type] = calculate_accuracy(subset)
+
+    _print_report(overall, by_type, mode_value, provider)
 
     output = {
-        # FIX: plain string, not enum object
-        "mode": mode_value,
-        "provider": provider,
+        "mode":        mode_value,
+        "provider":    provider,
         "sample_size": sample_size,
-        "metrics": metrics,
-        "results": results,
+        "metrics":     overall,
+        "by_type":     by_type,
+        "results":     results,
     }
-
     with open(output_file, "w") as fh:
         json.dump(output, fh, indent=2)
+    logger.info(f"Results saved → {output_file}")
 
-    logger.info(f"Results saved to: {output_file}")
-    return metrics
+    return overall
+
+
+def _print_report(overall: dict, by_type: dict, mode: str, provider: str) -> None:
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print(f"  RapidIndex  ·  FinanceBench Results")
+    print(f"  Mode: {mode}   Provider: {provider}")
+    print(sep)
+    print(f"  Total questions : {overall.get('total', 0)}")
+    print(f"  Contains match  : {overall.get('contains_accuracy', 0):.1%}")
+    print(f"  Number match    : {overall.get('number_accuracy', 0):.1%}")
+    print(f"  Avg latency     : {overall.get('avg_latency_ms', 0):.0f} ms")
+    print(f"  Avg confidence  : {overall.get('avg_confidence', 0):.2f}")
+
+    if by_type:
+        print(f"\n  By question type:")
+        for q_type, m in by_type.items():
+            label = FinanceBenchDataset.QUESTION_TYPES.get(q_type, q_type)
+            print(
+                f"    {q_type:<22}  n={m['total']:<4}  "
+                f"contains={m['contains_accuracy']:.1%}  "
+                f"number={m['number_accuracy']:.1%}"
+            )
+    print(sep + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run RapidIndex on FinanceBench")
+    parser.add_argument(
+        "--mode",
+        choices=[m.value for m in RetrievalMode],
+        default=RetrievalMode.REASONING.value,
+    )
+    parser.add_argument("--sample-size", type=int, default=50)
+    parser.add_argument("--provider", choices=["anthropic", "ollama"], default=None)
+    parser.add_argument("--company", default=None, help="Filter to one company, e.g. 3M")
+    parser.add_argument("--output", default="benchmark_results.json")
+    parser.add_argument(
+        "--data-dir",
+        default="./benchmarking/datasets/financebench",
+    )
+    args = parser.parse_args()
+
+    asyncio.run(
+        run_benchmark(
+            mode=RetrievalMode(args.mode),
+            sample_size=args.sample_size,
+            output_file=args.output,
+            llm_provider=args.provider,
+            company_filter=args.company,
+            data_dir=args.data_dir,
+        )
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(
-        run_benchmark(mode=RetrievalMode.REASONING, sample_size=50)
-    )
+    main()

@@ -9,6 +9,29 @@ map.txt
 # C extensions
 *.so
 
+# FinanceBench data
+benchmarking/datasets/financebench/
+
+# RapidIndex runtime artifacts
+rapidindex.db
+.cache/
+rapidindex.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Benchmark outputs
+benchmark_results*.json
+
 # Distribution / packaging
 .Python
 build/
