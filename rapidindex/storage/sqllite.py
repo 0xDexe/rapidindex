@@ -24,6 +24,15 @@ class SQLiteStorage:
     def save_document(self, document: Document) -> bool:
         session = get_session(self.engine)
         try:
+            # FIX: Delete any existing document (and cascade-delete its
+            # sections) before inserting.  This prevents UNIQUE constraint
+            # violations when re-indexing the same file — the old rows are
+            # removed first so the new INSERT succeeds cleanly.
+            existing = session.query(DocumentModel).filter_by(id=document.id).first()
+            if existing:
+                session.delete(existing)
+                session.flush()
+
             doc_model = DocumentModel(
                 id=document.id,
                 title=document.title,

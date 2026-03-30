@@ -304,10 +304,21 @@ class BaseParser(ABC):
                     min_length=self.config.min_section_length
                 )
         
-        # Validate sections
+        # FIX: Make section IDs globally unique by prefixing with the
+        # document ID.  Previously every document produced sec_0001,
+        # sec_0002, tbl_p0005_t01, etc. — these collide in the sections
+        # table (where id is the primary key) when multiple documents are
+        # indexed, causing a UNIQUE constraint violation that rolls back
+        # the entire INSERT and leaves the document unsaved.
+        doc_prefix = document.id
         for i, section in enumerate(document.sections):
             if not section.id:
-                section.id = f"sec_{i+1:04d}"
+                # No ID at all — generate one with the doc prefix
+                section.id = f"{doc_prefix}_sec_{i+1:04d}"
+            elif not section.id.startswith(doc_prefix):
+                # Has a local ID (e.g. sec_0001, tbl_p0005_t01) —
+                # prefix it so it becomes globally unique
+                section.id = f"{doc_prefix}_{section.id}"
         
         return document
     
