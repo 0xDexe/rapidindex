@@ -125,10 +125,29 @@ async def run_benchmark(
             logger.error(f"Failed to index {doc_path.name}: {exc}")
 
     # ------------------------------------------------------------------
+    # Drop questions whose PDF isn't on disk — running them produces
+    # "I don't have enough information" answers that silently tank metrics.
+    # ------------------------------------------------------------------
+    pdfs_dir = Path(data_dir) / "pdfs"
+    answerable = [
+        q for q in questions
+        if (pdfs_dir / f"{q.get('doc_name', '')}.pdf").exists()
+    ]
+    skipped = len(questions) - len(answerable)
+    if skipped:
+        logger.warning(
+            f"Skipping {skipped} questions — PDFs not on disk. "
+            f"Run: python -m benchmarking.setup_financebench --download-pdfs"
+        )
+    if not answerable:
+        logger.error("No answerable questions — no PDFs downloaded yet.")
+        return {}
+
+    # ------------------------------------------------------------------
     # Run queries
     # ------------------------------------------------------------------
-    questions_to_run = questions[:sample_size]
-    logger.info(f"Running {len(questions_to_run)} queries...")
+    questions_to_run = answerable[:sample_size]
+    logger.info(f"Running {len(questions_to_run)} answerable questions (of {len(answerable)} available)...")
     results = []
 
     for i, q in enumerate(questions_to_run):
@@ -136,10 +155,6 @@ async def run_benchmark(
         ground_truth = q.get("answer", "")
         doc_name     = q.get("doc_name", "")
         q_type       = q.get("question_type", "unknown")
-
-        pdf_present = (Path(data_dir) / "pdfs" / f"{doc_name}.pdf").exists()
-        if not pdf_present:
-            logger.warning(f"PDF not on disk, answer may be wrong: {doc_name}")
 
         logger.info(f"[{i+1}/{len(questions_to_run)}] ({q_type}) {query[:80]}...")
 
