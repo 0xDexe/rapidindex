@@ -2,7 +2,6 @@
 """SQLite storage backend."""
 
 from typing import List, Optional
-from sqlalchemy.orm import Session
 from loguru import logger
 
 from .models import DocumentModel, SectionModel, init_db, get_session
@@ -38,7 +37,7 @@ class SQLiteStorage:
                 title=document.title,
                 file_path=document.file_path,
                 document_type=document.document_type,
-                metadata=document.metadata,
+                doc_metadata=self._serialize_metadata(document.metadata),
                 indexed_at=document.indexed_at,
             )
             for section in document.sections:
@@ -79,21 +78,18 @@ class SQLiteStorage:
         session = get_session(self.engine)
         try:
             docs = session.query(DocumentModel).all()
-            result = []
-            for d in docs:
-                metadata = self._parse_metadata(d.metadata)
-                result.append(
-                    Document(
-                        id=d.id,
-                        title=d.title,
-                        file_path=d.file_path,
-                        document_type=d.document_type,
-                        sections=[],   # lightweight listing — no section bodies
-                        metadata=metadata,
-                        indexed_at=d.indexed_at,
-                    )
+            return [
+                Document(
+                    id=d.id,
+                    title=d.title,
+                    file_path=d.file_path,
+                    document_type=d.document_type,
+                    sections=[],
+                    metadata=self._parse_metadata(d.doc_metadata),
+                    indexed_at=d.indexed_at,
                 )
-            return result
+                for d in docs
+            ]
         finally:
             session.close()
 
@@ -165,9 +161,28 @@ class SQLiteStorage:
             file_path=doc_model.file_path,
             document_type=doc_model.document_type,
             sections=sections,
-            metadata=self._parse_metadata(doc_model.metadata),
+            metadata=self._parse_metadata(doc_model.doc_metadata),
             indexed_at=doc_model.indexed_at,
         )
+
+    @staticmethod
+    def _serialize_metadata(raw) -> dict:
+        """Convert metadata to a JSON-safe dict.
+
+        PDFMetadata.dict() can contain datetime objects (creation_date,
+        modification_date) which SQLAlchemy's JSON column type cannot
+        serialize.  We convert them to ISO-format strings here.
+        """
+        import json
+        from datetime import datetime
+
+        def _default(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+        # Round-trip through json to coerce all non-serialisable values.
+        return json.loads(json.dumps(raw or {}, default=_default))
 
     @staticmethod
     def _parse_metadata(raw) -> dict:
