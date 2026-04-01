@@ -11,7 +11,8 @@ map.txt
 
 benchmarking/datasets/financebench/documents/
 benchmarking/datasets/financebench/
-
+rapidindex.db
+*.db
 
 # Distribution / packaging
 .Python
